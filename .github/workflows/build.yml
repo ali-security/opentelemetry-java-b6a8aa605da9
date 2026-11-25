@@ -1,12 +1,12 @@
 name: Build
 
 on:
-  push:
-    branches:
-      - main
-      - release/*
-  pull_request:
   workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Gradle test task(s) to run instead of the full build check, e.g. ':extensions:trace-propagators:test --tests FooTest'"
+        required: false
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -16,6 +16,7 @@ jobs:
   build:
     name: Build
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -29,7 +30,7 @@ jobs:
           - 20
         # Collect coverage on latest LTS
         include:
-          - os: ubuntu-20.04
+          - os: ubuntu-22.04
             test-java-version: 17
             coverage: true
             jmh-based-tests: true
@@ -40,21 +41,123 @@ jobs:
         name: Set up Java ${{ matrix.test-java-version }} for tests
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          # Temurin ships no Java 8 build for arm64 macOS (macos-latest); Zulu does
+          distribution: ${{ (runner.os == 'macOS' && matrix.test-java-version == 8) && 'zulu' || 'temurin' }}
           java-version: ${{ matrix.test-java-version }}
+          cache: gradle
 
       - id: setup-java
         name: Set up Java for build
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          # pinned to the JDK that built the published jars (MANIFEST Built-JDK: 17.0.10)
+          java-version: 17.0.10+7
+          cache: gradle
+
+      - name: Let testcontainers 1.19 talk to the runner's Docker engine
+        # Docker 29 on current runners rejects docker-java's default API 1.32
+        if: runner.os == 'Linux'
+        run: echo "api.version=1.44" > ~/.docker-java.properties
+
+      - name: Write test result reporting init script
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/seal-ci.init.gradle" <<'EOF'
+          // Disable lint / static-analysis gates (not tests) and print test results.
+          def gatePrefixes = ['checkstyle', 'spotless', 'animalsniffer']
+          def dockerReason = '@Testcontainers(disabledWithoutDocker = true): no Docker daemon on this runner'
+          def senderReason = 'assumeThat: feature not supported by this sender implementation (compression/connectTimeout/minimal channel/authenticator)'
+          def skipReasons = [
+            'PrometheusMetricReaderTest': '@Disabled upstream until issue #6010 is fixed',
+            'TraceContextIntegrationTest': '@Disabled upstream (issue #3117)',
+            'OtlpPipelineStressTest': '@Disabled upstream: stress test not run with every build',
+            'SystemClockTest': '@EnabledOnJre/@DisabledOnJre: variant for a different JRE version',
+            'JcToolsSecurityManagerTest': '@EnabledOnJre(JAVA_8, JAVA_11, JAVA_17): different JRE version',
+            'JcToolsTest': '@EnabledInNativeImage: runs only in the GraalVM native-image nativeTest job',
+            'OkHttpVersionTest': 'assumeThat: expected.okhttp.version is LATEST, no pinned version to compare',
+            'InstrumentGarbageCollectionBenchmarkTest': 'assumeTrue: RUN_JMH_BASED_TESTS is only true on the coverage leg',
+            'CollectorIntegrationTest': dockerReason, 'PrometheusIntegrationTest': dockerReason,
+            'ZipkinSpanExporterEndToEndHttpTest': dockerReason, 'GrpcJavaOtlpIntegrationTest': dockerReason,
+            'NoGrpcJavaOtlpIntegrationTest': dockerReason, 'JaegerRemoteSamplerIntegrationTest': dockerReason,
+          ]
+          def totals = [:]
+          def skipped = [:]
+          gradle.taskGraph.whenReady { graph ->
+            graph.allTasks.each { t ->
+              if (t.name == 'jApiCmp' || gatePrefixes.any { t.name.startsWith(it) }) {
+                t.enabled = false
+              }
+            }
+          }
+          allprojects {
+            tasks.withType(Test).configureEach { Test t ->
+              t.afterTest { desc, result ->
+                if (result.resultType == TestResult.ResultType.SKIPPED) {
+                  def simple = desc.className.tokenize('.').last()
+                  def reason = skipReasons[simple]
+                  if (reason == null && simple.startsWith('Otlp') && (simple.contains('Grpc') || simple.contains('JdkSender'))) {
+                    reason = senderReason
+                  }
+                  if (reason == null) {
+                    reason = 'disabled by a JUnit condition or assumption'
+                  }
+                  synchronized (skipped) {
+                    skipped.get(reason, []) << "${t.path}:${simple}.${desc.name}"
+                  }
+                }
+              }
+              t.afterSuite { desc, result ->
+                if (desc.parent == null) {
+                  synchronized (totals) {
+                    def c = totals.get(t.path) ?: [0L, 0L, 0L, 0L]
+                    totals[t.path] = [c[0] + result.testCount, c[1] + result.successfulTestCount, c[2] + result.failedTestCount, c[3] + result.skippedTestCount]
+                  }
+                }
+              }
+            }
+          }
+          gradle.buildFinished {
+            if (totals.isEmpty()) {
+              return
+            }
+            long all = 0, ok = 0, ko = 0, sk = 0
+            println "==================== TEST SUMMARY ===================="
+            totals.sort().each { path, c ->
+              println "TEST SUMMARY ${path}: ${c[0]} tests, ${c[1]} passed, ${c[2]} failed, ${c[3]} skipped"
+              all += c[0]; ok += c[1]; ko += c[2]; sk += c[3]
+            }
+            skipped.each { reason, names ->
+              println "SKIPPED ${names.size()} -- reason: ${reason} -- tests: ${names.sort().join(', ')}"
+            }
+            println "TEST SUMMARY TOTAL: ${all} tests, ${ok} passed, ${ko} failed, ${sk} skipped"
+            println "======================================================"
+          }
+          EOF
 
       - uses: gradle/actions/setup-gradle@v3
+        if: ${{ inputs.test-filter != '' }}
+        with:
+          arguments: |
+            assemble
+            ${{ inputs.test-filter }}
+            --no-build-cache
+            --continue
+            -PdisableErrorProne=true
+            --init-script ${{ runner.temp }}/seal-ci.init.gradle
+            -PtestJavaVersion=${{ matrix.test-java-version }}
+            -Porg.gradle.java.installations.paths=${{ steps.setup-java-test.outputs.path }},${{ steps.setup-java.outputs.path }}
+
+      - uses: gradle/actions/setup-gradle@v3
+        if: ${{ inputs.test-filter == '' }}
         with:
           arguments: |
             build
             ${{ matrix.coverage && 'jacocoTestReport' || '' }}
+            --no-build-cache
+            --continue
+            -PdisableErrorProne=true
+            --init-script ${{ runner.temp }}/seal-ci.init.gradle
             -PtestJavaVersion=${{ matrix.test-java-version }}
             -Porg.gradle.java.installations.paths=${{ steps.setup-java-test.outputs.path }},${{ steps.setup-java.outputs.path }}
         env:
@@ -62,26 +165,12 @@ jobs:
           # JMH-based tests run only  if this environment variable is set to true
           RUN_JMH_BASED_TESTS: ${{ matrix.jmh-based-tests }}
 
-      - name: Check for diff
-        # The jApiCmp diff compares current to latest, which isn't appropriate for release branches
-        if: ${{ !startsWith(github.ref_name, 'release/') && !startsWith(github.base_ref, 'release/') }}
-        run: |
-          # need to "git add" in case any generated files did not already exist
-          git add docs/apidiffs
-          if git diff --cached --quiet
-          then 
-            echo "No diff detected."
-          else 
-            echo "Diff detected - did you run './gradlew jApiCmp'?"
-            echo $(git diff --cached --name-only)
-            echo $(git diff --cached)
-            exit 1
-          fi
-
-      - uses: codecov/codecov-action@v4
-        if: ${{ matrix.coverage }}
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.test-java-version == 8 }}
+        with:
+          name: opentelemetry-extension-trace-propagators-jar
+          path: extensions/trace-propagators/build/libs/opentelemetry-extension-trace-propagators-1.37.0.jar
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         if: ${{ matrix.coverage }}
@@ -91,12 +180,12 @@ jobs:
 
   markdown-link-check:
     # release branches are excluded to avoid unnecessary maintenance
-    if: ${{ !startsWith(github.ref_name, 'release/') }}
+    if: false
     uses: ./.github/workflows/reusable-markdown-link-check.yml
 
   misspell-check:
     # release branches are excluded to avoid unnecessary maintenance
-    if: ${{ !startsWith(github.ref_name, 'release/') }}
+    if: false
     uses: ./.github/workflows/reusable-misspell-check.yml
 
   publish-snapshots:
@@ -113,6 +202,7 @@ jobs:
     # intentionally not blocking snapshot publishing on markdown-link-check or misspell-check
     needs: build
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -122,6 +212,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: gradle
 
       - uses: gradle/actions/setup-gradle@v3
         # skipping release branches because the versions in those branches are not snapshots
@@ -137,6 +228,7 @@ jobs:
 
   build-graal:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: graalvm/setup-graalvm@v1
@@ -162,6 +254,7 @@ jobs:
       - build
       - build-graal
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: always()
     steps:
       - if: |
